@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      Content-Security-Policy: restrict the renderer's network surface.
+      - media: is the internal file-serving scheme (image thumbnails + metadata fetch)
+      - https: fonts/images for the in-browser preview fallback
+      - ws/http localhost is required by Vite HMR in dev mode
+      script-src keeps 'unsafe-inline' only because @vitejs/plugin-react injects an
+      inline preamble during development; production bundles are fully external.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' media: data: blob: https:; connect-src 'self' media: https: http://localhost:* ws://localhost:*; object-src 'none'; base-uri 'self'" />
+    <link rel="icon" type="image/png" href="/app-icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ViewView - Image Explorer & Viewer</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
