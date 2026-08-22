@@ -8,6 +8,8 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { SECTION_CARD_STYLE } from './tabStyles';
+// Single source of truth: the badge below always matches package.json.
+import { version as appVersion } from '../../../../package.json';
 
 const GithubIcon: React.FC<{ size?: number; color?: string }> = ({ size = 20, color = 'currentColor' }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -89,7 +91,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({ onOpenLink }) => {
               ViewView (뷰뷰)
             </span>
             <span style={{ fontSize: '11px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px', background: 'var(--accent)', color: '#ffffff' }}>
-              v1.0.0 Release
+              v{appVersion} Release
             </span>
             <span style={{ fontSize: '10px', fontWeight: 600, padding: '2px 6px', borderRadius: '4px', background: 'rgba(16, 185, 129, 0.15)', color: '#10b981', border: '1px solid rgba(16, 185, 129, 0.3)' }}>
               MIT License
