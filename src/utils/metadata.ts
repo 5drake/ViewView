@@ -1,11 +1,33 @@
 import exifr from 'exifr';
 import { ExifData, ColorPaletteItem } from '../types';
 
+// A corrupt chunk length must never OOM the tab via a giant decode.
+const MAX_PNG_TEXT_CHUNK = 16 * 1024 * 1024;
+
 /**
- * Reads PNG tEXt and iTXt chunks directly from an ArrayBuffer for 100% reliable metadata recovery
+ * Inflates zlib/deflate data (zTXt chunks, compressed iTXt) in the browser.
+ * Returns null when DecompressionStream is unavailable or the data is corrupt.
  */
-function extractPngMetadata(buffer: ArrayBuffer): Record<string, string> {
+async function inflateTextAsync(data: Uint8Array): Promise<string | null> {
+  try {
+    if (typeof DecompressionStream === 'undefined') return null;
+    const stream = new Blob([data as BlobPart]).stream().pipeThrough(new DecompressionStream('deflate'));
+    const buf = await new Response(stream).arrayBuffer();
+    return new TextDecoder('utf-8').decode(buf);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reads PNG text chunks (tEXt / iTXt / zTXt) directly from an ArrayBuffer for
+ * reliable metadata recovery. Every chunk is bounds-checked so one corrupt
+ * length skips only itself instead of throwing away all remaining metadata;
+ * compressed chunks are inflated instead of decoding to mojibake.
+ */
+async function extractPngMetadata(buffer: ArrayBuffer): Promise<Record<string, string>> {
   const result: Record<string, string> = {};
+  const decoder = new TextDecoder('utf-8');
   try {
     const view = new DataView(buffer);
     // Check PNG signature: 89 50 4E 47 0D 0A 1A 0A
@@ -15,9 +37,8 @@ function extractPngMetadata(buffer: ArrayBuffer): Record<string, string> {
 
     let offset = 8;
     const len = buffer.byteLength;
-    const decoder = new TextDecoder('utf-8');
 
-    while (offset + 8 < len) {
+    while (offset + 12 <= len) {
       const chunkLength = view.getUint32(offset);
       const chunkType = String.fromCharCode(
         view.getUint8(offset + 4),
@@ -28,31 +49,52 @@ function extractPngMetadata(buffer: ArrayBuffer): Record<string, string> {
 
       if (chunkType === 'IEND') break;
 
-      if (chunkType === 'tEXt') {
-        const chunkData = new Uint8Array(buffer, offset + 8, chunkLength);
-        let nullIdx = 0;
-        while (nullIdx < chunkData.length && chunkData[nullIdx] !== 0) {
-          nullIdx++;
+      if (chunkType === 'tEXt' || chunkType === 'iTXt' || chunkType === 'zTXt') {
+        if (chunkLength > MAX_PNG_TEXT_CHUNK) {
+          // Absurd declared size — skip the content but keep walking; the
+          // arithmetic below still uses the declared length.
+          offset += 12 + chunkLength;
+          continue;
         }
-        const key = decoder.decode(chunkData.subarray(0, nullIdx));
-        const value = decoder.decode(chunkData.subarray(nullIdx + 1));
-        result[key] = value;
-      } else if (chunkType === 'iTXt') {
-        const chunkData = new Uint8Array(buffer, offset + 8, chunkLength);
-        let nullIdx = 0;
-        while (nullIdx < chunkData.length && chunkData[nullIdx] !== 0) {
-          nullIdx++;
+        if (offset + 12 + chunkLength > len) {
+          // Chunk claims to extend past EOF: the walk cannot be trusted
+          // beyond this point, but earlier chunks were already collected.
+          break;
         }
-        const key = decoder.decode(chunkData.subarray(0, nullIdx));
-        // iTXt format: keyword\0 compFlag(1B) compMethod(1B) langTag\0 transKey\0 text
-        let pos = nullIdx + 3;
-        while (pos < chunkData.length && chunkData[pos] !== 0) pos++;
-        pos++;
-        while (pos < chunkData.length && chunkData[pos] !== 0) pos++;
-        pos++;
-        if (pos < chunkData.length) {
-          const value = decoder.decode(chunkData.subarray(pos));
-          result[key] = value;
+
+        const chunkData = new Uint8Array(buffer, offset + 8, chunkLength);
+
+        if (chunkType === 'tEXt') {
+          let nullIdx = 0;
+          while (nullIdx < chunkData.length && chunkData[nullIdx] !== 0) nullIdx++;
+          const key = decoder.decode(chunkData.subarray(0, nullIdx));
+          result[key] = decoder.decode(chunkData.subarray(nullIdx + 1));
+        } else if (chunkType === 'zTXt') {
+          // keyword\0 compMethod(1B) deflate(text)
+          let nullIdx = 0;
+          while (nullIdx < chunkData.length && chunkData[nullIdx] !== 0) nullIdx++;
+          const key = decoder.decode(chunkData.subarray(0, nullIdx));
+          const inflated = await inflateTextAsync(chunkData.subarray(nullIdx + 2));
+          if (inflated !== null) result[key] = inflated;
+        } else {
+          // iTXt format: keyword\0 compFlag(1B) compMethod(1B) langTag\0 transKey\0 text
+          let nullIdx = 0;
+          while (nullIdx < chunkData.length && chunkData[nullIdx] !== 0) nullIdx++;
+          const key = decoder.decode(chunkData.subarray(0, nullIdx));
+          const compFlag = nullIdx + 1 < chunkData.length ? chunkData[nullIdx + 1] : 0;
+          let pos = nullIdx + 3;
+          while (pos < chunkData.length && chunkData[pos] !== 0) pos++;
+          pos++;
+          while (pos < chunkData.length && chunkData[pos] !== 0) pos++;
+          pos++;
+          if (pos < chunkData.length) {
+            if (compFlag) {
+              const inflated = await inflateTextAsync(chunkData.subarray(pos));
+              if (inflated !== null) result[key] = inflated;
+            } else {
+              result[key] = decoder.decode(chunkData.subarray(pos));
+            }
+          }
         }
       }
 
@@ -347,9 +389,31 @@ function detectAndParseAIMetadata(meta: Record<string, any>, exif: ExifData): vo
     return;
   }
 
-  // 5. Fallback for raw prompt string (ignoring JSON code)
+  // 5. Fallback for raw prompt string (ignoring JSON code).
+  // Only trust raw text when it carries real generation-parameter patterns or
+  // came from a known AI tool, otherwise ordinary captions get misattributed.
   if (typeof textParams === 'string' && textParams.trim().length > 5 && !textParams.trim().startsWith('{')) {
-    exif.aiPrompt = textParams.trim();
+    const rawPrompt = textParams.trim();
+    const looksLikeGenParams =
+      /\bSteps?:\s*\d/i.test(rawPrompt) ||
+      /\bSeed:?\s*\d/i.test(rawPrompt) ||
+      /\bSampler\s*:/i.test(rawPrompt) ||
+      /\bCFG\b/i.test(rawPrompt) ||
+      /\bGuidance\b/i.test(rawPrompt) ||
+      (/\bScale\b/i.test(rawPrompt) && /\bModel\b/i.test(rawPrompt)) ||
+      /--\w{1,4}\b/.test(rawPrompt);
+    const looksLikeAiSoftware =
+      software.includes('stable diffusion') ||
+      software.includes('comfyui') ||
+      software.includes('midjourney') ||
+      software.includes('novelai') ||
+      software.includes('nai') ||
+      software.includes('dall-e') ||
+      software.includes('firefly') ||
+      software.includes('flux');
+    if (looksLikeGenParams || looksLikeAiSoftware) {
+      exif.aiPrompt = rawPrompt;
+    }
   }
 }
 
@@ -371,7 +435,7 @@ export async function parseImageExif(imageUrl: string, filePath?: string): Promi
       } else {
         const response = await fetch(imageUrl);
         const arrayBuffer = await response.arrayBuffer();
-        const pngMeta = extractPngMetadata(arrayBuffer);
+        const pngMeta = await extractPngMetadata(arrayBuffer);
         Object.assign(collectedMeta, pngMeta);
       }
     } catch {}

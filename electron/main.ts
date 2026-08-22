@@ -58,6 +58,12 @@ function createWindow() {
   // Remove default menu for clean UI
   mainWindow.setMenuBarVisibility(false);
 
+  // Drop the reference when the window is gone so watcher sends and dialogs
+  // never touch a destroyed window.
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
   } else {
@@ -67,7 +73,7 @@ function createWindow() {
 
 // Register media:// protocol
 function registerMediaProtocol() {
-  protocol.handle('media', (request) => {
+  protocol.handle('media', async (request) => {
     try {
       const url = new URL(request.url);
       let targetPath = url.searchParams.get('path');
@@ -98,7 +104,17 @@ function registerMediaProtocol() {
       }
 
       const fileUrl = pathToFileURL(targetPath).toString();
-      return net.fetch(fileUrl);
+      const fileResponse = await net.fetch(fileUrl);
+      // Re-wrap with long-lived cache headers: custom-protocol responses carry
+      // no caching metadata by default, so every virtualization remount of an
+      // <img> re-read the whole file. With these headers Chromium's image cache
+      // can serve remounted thumbnails without touching the disk again.
+      const headers = new Headers(fileResponse.headers);
+      headers.set('Cache-Control', 'public, max-age=31536000');
+      return new Response(fileResponse.body, {
+        status: fileResponse.status,
+        headers,
+      });
     } catch (err: any) {
       console.error('Failed to load media via protocol:', err);
       return new Response('Failed to load media: ' + err.message, { status: 500 });
@@ -311,6 +327,9 @@ async function readPngTextChunks(filePath: string): Promise<Record<string, strin
     if (sigRead.bytesRead < 8) return result;
     if (sig[0] !== 0x89 || sig[1] !== 0x50 || sig[2] !== 0x4E || sig[3] !== 0x47) return result;
 
+    const stat = await handle.stat();
+    const fileSize = stat.size;
+
     let offset = 8;
     while (true) {
       const header = Buffer.alloc(8);
@@ -322,8 +341,9 @@ async function readPngTextChunks(filePath: string): Promise<Record<string, strin
       if (type === 'IEND') break;
 
       if (type === 'tEXt' || type === 'iTXt' || type === 'zTXt') {
-        // Sanity cap (256MB) so a corrupt length field cannot OOM the process
-        if (length > 0 && length <= 256 * 1024 * 1024) {
+        // Sanity cap (16MB) + file bounds so a corrupt length field can
+        // neither OOM the process nor read past EOF.
+        if (length > 0 && length <= 16 * 1024 * 1024 && offset + 12 + length <= fileSize) {
           const chunk = Buffer.alloc(length);
           await handle.read(chunk, 0, length, offset + 8);
           const parsed = parsePngTextChunk(type, chunk);
@@ -364,49 +384,61 @@ async function scanDirectory(dirPath: string) {
       url: string;
     }> = [];
 
-    for (const entry of entries) {
-      try {
-        const fullPath = path.join(dirPath, entry.name);
-        
-        if (entry.isDirectory()) {
-          // Exclude system/hidden directories if necessary
-          if (!entry.name.startsWith('$') && entry.name !== 'System Volume Information') {
-            folders.push({
-              name: entry.name,
-              path: fullPath,
-              hasChildren: true,
-            });
-          }
-        } else if (entry.isFile()) {
-          const ext = path.extname(entry.name).toLowerCase();
-          if (IMAGE_EXTENSIONS.has(ext)) {
-            const stats = await fs.promises.stat(fullPath);
-            const dims = await getImageDimensionsFast(fullPath);
-            const aspectRatio = dims.width && dims.height ? +(dims.width / dims.height).toFixed(4) : 1.333;
-            
-            // media:// format with URL-encoded query parameter
-            const safeMediaUrl = `media://local-file?path=${encodeURIComponent(fullPath)}`;
+    const folderEntries = entries.filter(
+      (entry) => entry.isDirectory() && !entry.name.startsWith('$') && entry.name !== 'System Volume Information'
+    );
+    const fileEntries = entries.filter(
+      (entry) => entry.isFile() && IMAGE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())
+    );
 
-            images.push({
-              id: fullPath,
-              name: entry.name,
-              path: fullPath,
-              dir: dirPath,
-              size: stats.size,
-              extension: ext.replace('.', '').toUpperCase(),
-              createdAt: stats.birthtimeMs || stats.ctimeMs,
-              modifiedAt: stats.mtimeMs,
-              width: dims.width,
-              height: dims.height,
-              aspectRatio,
-              url: safeMediaUrl,
-            });
-          }
-        }
-      } catch (err) {
-        // Skip permission denied files
-      }
+    for (const entry of folderEntries) {
+      folders.push({
+        name: entry.name,
+        path: path.join(dirPath, entry.name),
+        hasChildren: true,
+      });
     }
+
+    // Bounded-concurrency stat + header probe. A sequential per-file await left
+    // fast SSDs idle on large directories, while an unbounded Promise.all risks
+    // exhausting file handles on huge folders — a small worker pool gets both
+    // right and keeps the main process event loop responsive.
+    const CONCURRENCY = 24;
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < fileEntries.length) {
+        const entry = fileEntries[cursor++];
+        try {
+          const fullPath = path.join(dirPath, entry.name);
+          const stats = await fs.promises.stat(fullPath);
+          const dims = await getImageDimensionsFast(fullPath);
+          const aspectRatio = dims.width && dims.height ? +(dims.width / dims.height).toFixed(4) : 1.333;
+
+          // media:// format with URL-encoded query parameter
+          const safeMediaUrl = `media://local-file?path=${encodeURIComponent(fullPath)}`;
+
+          images.push({
+            id: fullPath,
+            name: entry.name,
+            path: fullPath,
+            dir: dirPath,
+            size: stats.size,
+            extension: path.extname(entry.name).replace('.', '').toUpperCase(),
+            createdAt: stats.birthtimeMs || stats.ctimeMs,
+            modifiedAt: stats.mtimeMs,
+            width: dims.width,
+            height: dims.height,
+            aspectRatio,
+            url: safeMediaUrl,
+          });
+        } catch {
+          // Skip permission denied / vanished files
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, fileEntries.length) }, () => worker())
+    );
 
     // Sort folders alphabetically
     folders.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
@@ -430,37 +462,51 @@ async function scanDirectory(dirPath: string) {
 // Get metadata for specific image file paths (for bookmark gallery view)
 async function getImagesMetadata(filePaths: string[]) {
   const images: any[] = [];
-  for (const fullPath of filePaths) {
-    try {
-      if (fs.existsSync(fullPath)) {
+  await Promise.all(
+    filePaths.map(async (fullPath) => {
+      try {
+        if (!fs.existsSync(fullPath)) return;
         const stats = await fs.promises.stat(fullPath);
-        if (stats.isFile()) {
-          const ext = path.extname(fullPath).toLowerCase();
-          const fileName = path.basename(fullPath);
-          const dims = await getImageDimensionsFast(fullPath);
-          const aspectRatio = dims.width && dims.height ? +(dims.width / dims.height).toFixed(4) : 1.333;
-          const safeMediaUrl = `media://local-file?path=${encodeURIComponent(fullPath)}`;
+        if (!stats.isFile()) return;
+        const ext = path.extname(fullPath).toLowerCase();
+        const fileName = path.basename(fullPath);
+        const dims = await getImageDimensionsFast(fullPath);
+        const aspectRatio = dims.width && dims.height ? +(dims.width / dims.height).toFixed(4) : 1.333;
+        const safeMediaUrl = `media://local-file?path=${encodeURIComponent(fullPath)}`;
 
-          images.push({
-            id: fullPath,
-            name: fileName,
-            path: fullPath,
-            dir: path.dirname(fullPath),
-            size: stats.size,
-            extension: ext.replace('.', '').toUpperCase(),
-            createdAt: stats.birthtimeMs || stats.ctimeMs,
-            modifiedAt: stats.mtimeMs,
-            width: dims.width,
-            height: dims.height,
-            aspectRatio,
-            url: safeMediaUrl,
-            isBookmarked: true,
-          });
-        }
-      }
-    } catch {}
-  }
+        images.push({
+          id: fullPath,
+          name: fileName,
+          path: fullPath,
+          dir: path.dirname(fullPath),
+          size: stats.size,
+          extension: ext.replace('.', '').toUpperCase(),
+          createdAt: stats.birthtimeMs || stats.ctimeMs,
+          modifiedAt: stats.mtimeMs,
+          width: dims.width,
+          height: dims.height,
+          aspectRatio,
+          url: safeMediaUrl,
+          isBookmarked: true,
+        });
+      } catch {}
+    })
+  );
   return images;
+}
+
+// Single instance: launching ViewView again focuses the existing window
+// instead of starting a second process fighting over the same watcher and
+// settings files.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
 }
 
 app.whenReady().then(() => {
@@ -694,7 +740,10 @@ ipcMain.handle('copy-files-to-vault', async (_, { sourcePaths, targetDir }: { so
         counter++;
       }
 
-      fs.copyFileSync(src, destPath);
+      // Async, non-blocking copy: fs.copyFileSync here stalled the main
+      // process event loop (every IPC + all UI) for the duration of large
+      // multi-hundred-MB AI image batches.
+      await fs.promises.copyFile(src, destPath);
       copiedCount++;
     }
 

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { ImageItem, PromptIndexItem } from '../types';
 import { parseImageExif } from '../utils/metadata';
 
@@ -43,10 +43,13 @@ export function usePromptIndex(images: ImageItem[]) {
   const [indexVersion, setIndexVersion] = useState<number>(0);
   const [isIndexing, setIsIndexing] = useState<boolean>(false);
   const [indexedCount, setIndexedCount] = useState<number>(0);
-  const isCancelledRef = useRef<boolean>(false);
 
   useEffect(() => {
-    isCancelledRef.current = false;
+    // Effect-local cancellation: a fresh effect run can never resurrect a
+    // previous folder's indexing chain (the old shared-ref approach was reset
+    // to false by the next run while the previous chain was still awaiting).
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     if (images.length === 0) {
       setIsIndexing(false);
       setIndexedCount(0);
@@ -68,7 +71,7 @@ export function usePromptIndex(images: ImageItem[]) {
 
     const BATCH_SIZE = 6;
     const processBatch = async () => {
-      if (isCancelledRef.current) return;
+      if (cancelled) return;
 
       const batch = unindexed.slice(currentIdx, currentIdx + BATCH_SIZE);
       if (batch.length === 0) {
@@ -103,19 +106,19 @@ export function usePromptIndex(images: ImageItem[]) {
       completedInFolder += batch.length;
       currentIdx += BATCH_SIZE;
 
-      if (!isCancelledRef.current) {
+      if (!cancelled) {
         setIndexedCount(completedInFolder);
         setIndexVersion((v) => v + 1);
         // Small delay to yield main thread
-        setTimeout(processBatch, 25);
+        timer = setTimeout(processBatch, 25);
       }
     };
 
-    const timer = setTimeout(processBatch, 50);
+    timer = setTimeout(processBatch, 50);
 
     return () => {
-      isCancelledRef.current = true;
-      clearTimeout(timer);
+      cancelled = true;
+      if (timer) clearTimeout(timer);
     };
   }, [images]);
 

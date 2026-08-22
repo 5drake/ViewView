@@ -101,6 +101,7 @@ export function App() {
     openDirectoryDialog,
     handleExternalDrop,
     trashFiles,
+    refreshDirectory,
     layoutMode,
     setLayoutMode,
     thumbnailSize,
@@ -115,7 +116,13 @@ export function App() {
     setSearchQuery,
     searchMode,
     setSearchMode,
+    error: explorerError,
   } = useExplorer(showToast, promptMatcher, settings.enableAutoRefresh, confirm);
+
+  // Surface scan/navigation failures instead of leaving the previous grid
+  // silently frozen. Dismissable per message; a new failure re-shows it.
+  const [dismissedError, setDismissedError] = useState<string | null>(null);
+  const activeExplorerError = explorerError && explorerError !== dismissedError ? explorerError : null;
 
   const promptIndex = usePromptIndex(rawImages);
 
@@ -292,8 +299,8 @@ export function App() {
         ? images.filter((img) => selectedImageIds.has(img.id)).map((img) => img.path)
         : selectedImage ? [selectedImage.path] : [];
 
-      // Copy selected image to clipboard (Ctrl+C / Cmd+C)
-      if ((e.ctrlKey || e.metaKey) && (e.key === 'c' || e.key === 'C')) {
+      // Copy selected image to clipboard (customizable; default Ctrl+C)
+      if (matchesActionBinding(e, keybindings.copyImage)) {
         if (targetPaths.length > 0) {
           e.preventDefault();
           if (window.electronAPI?.copyImageToClipboard) {
@@ -302,6 +309,46 @@ export function App() {
           showToast(targetPaths.length > 1 ? `${targetPaths.length}개 이미지 중 첫 번째 이미지가 클립보드에 복사되었습니다.` : '이미지가 클립보드에 복사되었습니다.', 'copy');
           return;
         }
+      }
+
+      // Copy file path(s) as text
+      if (matchesActionBinding(e, keybindings.copyPath)) {
+        if (targetPaths.length > 0) {
+          e.preventDefault();
+          const text = targetPaths.join('\n');
+          if (window.electronAPI?.copyTextToClipboard) {
+            window.electronAPI.copyTextToClipboard(text);
+          } else {
+            navigator.clipboard.writeText(text);
+          }
+          showToast(targetPaths.length > 1 ? `${targetPaths.length}개 경로가 복사되었습니다.` : '파일 경로가 복사되었습니다.', 'copy');
+          return;
+        }
+      }
+
+      // Show selected image in Windows Explorer
+      if (matchesActionBinding(e, keybindings.showInExplorer)) {
+        if (selectedImage && window.electronAPI?.showInFolder) {
+          e.preventDefault();
+          window.electronAPI.showInFolder(selectedImage.path);
+          return;
+        }
+      }
+
+      // Select all images in the current view
+      if (matchesActionBinding(e, keybindings.selectAll)) {
+        if (images.length > 0) {
+          e.preventDefault();
+          setSelectedImageIds(new Set(images.map((img) => img.id)));
+          return;
+        }
+      }
+
+      // Refresh current directory
+      if (matchesActionBinding(e, keybindings.refresh)) {
+        e.preventDefault();
+        refreshDirectory();
+        return;
       }
 
       // Check Storage Vault shortcut keys (1st & 2nd keys)
@@ -323,13 +370,13 @@ export function App() {
       window.removeEventListener('keydown', handleKeyDown);
     };
   }, [
-    goBack, 
-    goForward, 
-    goUp, 
-    canGoBack, 
-    canGoForward, 
-    handleToggleSidebar, 
-    handleToggleInspector, 
+    goBack,
+    goForward,
+    goUp,
+    canGoBack,
+    canGoForward,
+    handleToggleSidebar,
+    handleToggleInspector,
     settings.keybindings,
     quickLook,
     isSettingsOpen,
@@ -338,6 +385,8 @@ export function App() {
     selectedImage,
     selectedImageIds,
     trashFiles,
+    refreshDirectory,
+    showToast,
     vaults,
     sendToVault
   ]);
@@ -365,12 +414,22 @@ export function App() {
     };
 
     const handleDragLeave = (e: DragEvent) => {
+      // Mirror dragenter's Files gate: non-file drags previously drove the
+      // counter negative and could stick the overlay open.
+      if (!e.dataTransfer || !e.dataTransfer.types.includes('Files')) return;
       e.preventDefault();
       dragCounter.current -= 1;
       if (dragCounter.current <= 0) {
         dragCounter.current = 0;
         setIsWindowDragOver(false);
       }
+    };
+
+    // A drag cancelled outside the window (alt-tab, drop on the taskbar) never
+    // delivers matching leave events — clear the overlay defensively.
+    const handleDragCancelled = () => {
+      dragCounter.current = 0;
+      setIsWindowDragOver(false);
     };
 
     const handleDrop = (e: DragEvent) => {
@@ -380,17 +439,27 @@ export function App() {
       setIsWindowDragOver(false);
 
       if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-        const file = e.dataTransfer.files[0];
-        let filePath = '';
-        if (window.electronAPI?.getPathForFile) {
-          filePath = window.electronAPI.getPathForFile(file);
-        }
-        if (!filePath && (file as any).path) {
-          filePath = (file as any).path;
+        // Resolve every dropped item, not just the first: Explorer multi-drops
+        // silently discarded everything after file[0] before.
+        const paths: string[] = [];
+        for (const file of Array.from(e.dataTransfer.files)) {
+          let filePath = '';
+          if (window.electronAPI?.getPathForFile) {
+            filePath = window.electronAPI.getPathForFile(file);
+          }
+          if (!filePath && (file as any).path) {
+            filePath = (file as any).path;
+          }
+          if (filePath) {
+            paths.push(filePath);
+          }
         }
 
-        if (filePath) {
-          handleExternalDrop(filePath);
+        if (paths.length > 0) {
+          handleExternalDrop(paths[0]);
+          if (paths.length > 1) {
+            showToast?.(`첫 항목의 폴더로 이동했습니다 (드롭 ${paths.length}개 중 1번째)`, 'info');
+          }
         }
       }
     };
@@ -399,18 +468,20 @@ export function App() {
     window.addEventListener('dragover', handleDragOver);
     window.addEventListener('dragleave', handleDragLeave);
     window.addEventListener('drop', handleDrop);
+    window.addEventListener('blur', handleDragCancelled);
     return () => {
       window.removeEventListener('dragenter', handleDragEnter);
       window.removeEventListener('dragover', handleDragOver);
       window.removeEventListener('dragleave', handleDragLeave);
       window.removeEventListener('drop', handleDrop);
+      window.removeEventListener('blur', handleDragCancelled);
     };
-  }, [handleExternalDrop]);
+  }, [handleExternalDrop, showToast]);
 
   // Handle single and multi selection
   const handleSelectImage = useCallback((id: string, isMulti: boolean) => {
-    setSelectedImageId(id);
     if (isMulti) {
+      const isCurrentlySelected = selectedImageIds.has(id);
       setSelectedImageIds((prev) => {
         const next = new Set(prev);
         if (next.has(id)) {
@@ -420,10 +491,18 @@ export function App() {
         }
         return next;
       });
+      if (isCurrentlySelected) {
+        // Toggled OFF — it must not stay the inspector's current image while
+        // the selection count drops (previously showed an image with 0 selected).
+        setSelectedImageId((cur) => (cur === id ? null : cur));
+      } else {
+        setSelectedImageId(id);
+      }
     } else {
+      setSelectedImageId(id);
       setSelectedImageIds(new Set([id]));
     }
-  }, [setSelectedImageId, setSelectedImageIds]);
+  }, [selectedImageIds, setSelectedImageId, setSelectedImageIds]);
 
   const handleSortChange = (field: any, dir: any) => {
     setSortField(field);
@@ -471,6 +550,18 @@ export function App() {
 
       {/* Main Workspace (Sidebar + Gallery + Inspector) */}
       <main className="app-main">
+        {activeExplorerError && (
+          <div className="explorer-error-banner" role="alert">
+            <span className="explorer-error-message">⚠ {activeExplorerError}</span>
+            <button
+              className="nav-btn"
+              style={{ padding: '4px 12px', fontSize: '12px', flexShrink: 0 }}
+              onClick={() => setDismissedError(activeExplorerError)}
+            >
+              닫기
+            </button>
+          </div>
+        )}
         {/* Left Drive / Folder / Vaults Sidebar */}
         <Sidebar
           drives={drives}
@@ -511,6 +602,13 @@ export function App() {
           onNavigateToFolder={navigateTo}
           onShowToast={showToast}
           wheelThrottle={settings.explorerWheelThrottle}
+          placeholderStyle={settings.thumbnailPlaceholder}
+          thumbConcurrency={settings.thumbConcurrentLoads}
+          thumbCacheMb={settings.thumbCacheMaxMb}
+          thumbWarmLimit={settings.thumbWarmLimit}
+          keybindings={settings.keybindings}
+          defaultZoom={settings.defaultThumbnailSize}
+          onLayoutModeChange={setLayoutMode}
         />
 
         {/* Right EXIF & Histogram Inspector Panel */}

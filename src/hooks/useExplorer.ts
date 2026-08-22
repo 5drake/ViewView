@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { ImageItem, FolderItem, DriveInfo, SortField, SortDirection, LayoutMode, FilterOptions, FolderBookmark, ToastType, SearchMode } from '../types';
 import type { ConfirmFn } from '../components/Common/ConfirmDialog';
 import { parseSearchTokens } from './usePromptIndex';
@@ -17,8 +17,16 @@ export function useExplorer(
   const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
   const [selectedImageIds, setSelectedImageIds] = useState<Set<string>>(new Set());
   
-  const [history, setHistory] = useState<string[]>([]);
-  const [historyIndex, setHistoryIndex] = useState<number>(-1);
+  // Navigation history kept in ONE atomic state so concurrent navigations can
+  // never truncate the stack against a stale closure index (see navigateTo).
+  const [history, setHistory] = useState<{ stack: string[]; index: number }>({ stack: [], index: -1 });
+  const historyIndex = history.index;
+
+  // Monotonic id guarding async scan results: only the newest navigation may
+  // apply state; watch-triggered refreshes discard themselves when a newer
+  // navigation superseded them or the directory already changed.
+  const requestIdRef = useRef(0);
+  const currentPathRef = useRef<string>('');
 
   // Folder bookmarks (stored in localStorage)
   const [folderBookmarks, setFolderBookmarks] = useState<FolderBookmark[]>(() => {
@@ -47,18 +55,15 @@ export function useExplorer(
     const segs = folderPath.replace(/\\/g, '/').split('/').filter(Boolean);
     const autoName = name || segs[segs.length - 1] || folderPath;
 
-    setFolderBookmarks((prev) => {
-      let updated: FolderBookmark[];
-      if (exists) {
-        updated = prev.filter((b) => b.path.replace(/\\/g, '/').toLowerCase() !== normalized);
-      } else {
-        updated = [...prev, { path: folderPath, name: autoName, addedAt: Date.now() }];
-      }
-      try {
-        localStorage.setItem('viewview-folder-bookmarks', JSON.stringify(updated));
-      } catch {}
-      return updated;
-    });
+    // Compute the next value OUTSIDE the updater: localStorage writes inside a
+    // state updater are impure (StrictMode double-invokes updaters).
+    const updated: FolderBookmark[] = exists
+      ? folderBookmarks.filter((b) => b.path.replace(/\\/g, '/').toLowerCase() !== normalized)
+      : [...folderBookmarks, { path: folderPath, name: autoName, addedAt: Date.now() }];
+    setFolderBookmarks(updated);
+    try {
+      localStorage.setItem('viewview-folder-bookmarks', JSON.stringify(updated));
+    } catch {}
 
     if (exists) {
       showToast?.('폴더 북마크가 해제되었습니다.', 'info');
@@ -70,18 +75,16 @@ export function useExplorer(
   // Toggle image bookmark
   const toggleImageBookmark = useCallback((filePath: string) => {
     const isCurrentlyBookmarked = imageBookmarks.has(filePath);
-    setImageBookmarks((prev) => {
-      const next = new Set(prev);
-      if (next.has(filePath)) {
-        next.delete(filePath);
-      } else {
-        next.add(filePath);
-      }
-      try {
-        localStorage.setItem('viewview-image-bookmarks', JSON.stringify(Array.from(next)));
-      } catch {}
-      return next;
-    });
+    const next = new Set(imageBookmarks);
+    if (isCurrentlyBookmarked) {
+      next.delete(filePath);
+    } else {
+      next.add(filePath);
+    }
+    setImageBookmarks(next);
+    try {
+      localStorage.setItem('viewview-image-bookmarks', JSON.stringify(Array.from(next)));
+    } catch {}
 
     if (!isCurrentlyBookmarked) {
       showToast?.('이미지가 북마크에 추가되었습니다.', 'bookmark');
@@ -247,6 +250,10 @@ export function useExplorer(
 
   const navigateTo = useCallback(async (dirPath: string, pushHistory = true, selectTargetName?: string) => {
     if (!dirPath) return;
+    const reqId = ++requestIdRef.current;
+    // Record intent immediately so an in-flight refreshDirectory for another
+    // directory discards itself instead of painting over this navigation.
+    currentPathRef.current = dirPath;
     setIsLoading(true);
     setError(null);
 
@@ -255,10 +262,12 @@ export function useExplorer(
       try {
         if (window.electronAPI?.getImagesMetadata) {
           const metaImages = await window.electronAPI.getImagesMetadata(Array.from(imageBookmarks));
+          if (reqId !== requestIdRef.current) return; // superseded by a newer navigation
           setCurrentPath('bookmarks://images');
           setFolders([]);
           setImages(metaImages);
         } else {
+          if (reqId !== requestIdRef.current) return;
           setCurrentPath('bookmarks://images');
           setFolders([]);
           setImages([]);
@@ -266,16 +275,16 @@ export function useExplorer(
         setSelectedImageId(null);
         setSelectedImageIds(new Set());
         if (pushHistory) {
-          setHistory(prev => {
-            const updated = prev.slice(0, historyIndex + 1);
-            return [...updated, 'bookmarks://images'];
+          setHistory((h) => {
+            const stack = h.stack.slice(0, h.index + 1);
+            stack.push('bookmarks://images');
+            return { stack, index: stack.length - 1 };
           });
-          setHistoryIndex(prev => prev + 1);
         }
       } catch (err: any) {
-        setError(err.message);
+        if (reqId === requestIdRef.current) setError(err.message);
       } finally {
-        setIsLoading(false);
+        if (reqId === requestIdRef.current) setIsLoading(false);
       }
       return;
     }
@@ -283,10 +292,18 @@ export function useExplorer(
     if (window.electronAPI) {
       try {
         const result = await window.electronAPI.scanDirectory(dirPath, enableAutoRefresh);
+        // A newer navigation superseded this one — drop the stale result so a
+        // slow older scan can never paint its folder under the newer path.
+        if (reqId !== requestIdRef.current) return;
+
         if (result.error) {
           setError(result.error);
+          // Navigation failed — resync with the folder actually still displayed
+          // so watcher refreshes for it keep applying.
+          currentPathRef.current = currentPath;
         } else {
           setCurrentPath(result.currentPath);
+          currentPathRef.current = result.currentPath;
           setFolders(result.folders);
           setImages(result.images);
 
@@ -307,31 +324,39 @@ export function useExplorer(
           }
 
           if (pushHistory) {
-            setHistory(prev => {
-              const updated = prev.slice(0, historyIndex + 1);
-              return [...updated, result.currentPath];
+            setHistory((h) => {
+              const stack = h.stack.slice(0, h.index + 1);
+              stack.push(result.currentPath);
+              return { stack, index: stack.length - 1 };
             });
-            setHistoryIndex(prev => prev + 1);
           }
         }
       } catch (err: any) {
-        setError(err.message);
+        currentPathRef.current = currentPath;
+        if (reqId === requestIdRef.current) setError(err.message);
       } finally {
-        setIsLoading(false);
+        if (reqId === requestIdRef.current) setIsLoading(false);
       }
     } else {
       setCurrentPath(dirPath);
       setIsLoading(false);
     }
-  }, [historyIndex, imageBookmarks, enableAutoRefresh]);
+  }, [currentPath, imageBookmarks, enableAutoRefresh]);
 
   // Keep bookmarks view in sync if imageBookmarks array changes
   useEffect(() => {
     if (currentPath === 'bookmarks://images') {
       if (window.electronAPI?.getImagesMetadata) {
-        window.electronAPI.getImagesMetadata(Array.from(imageBookmarks)).then((metaImages) => {
-          setImages(metaImages);
-        });
+        let stale = false;
+        window.electronAPI.getImagesMetadata(Array.from(imageBookmarks))
+          .then((metaImages) => {
+            // Ignore late responses after the user navigated away.
+            if (!stale && currentPathRef.current === 'bookmarks://images') {
+              setImages(metaImages);
+            }
+          })
+          .catch(() => {});
+        return () => { stale = true; };
       }
     }
   }, [currentPath, imageBookmarks]);
@@ -346,8 +371,14 @@ export function useExplorer(
     const target = dirPath || currentPath;
     if (!target || !window.electronAPI) return;
 
+    const norm = (p: string) => p.replace(/\\/g, '/').toLowerCase();
+    // Do not bump the navigation counter — a refresh never supersedes a
+    // navigation. Instead, discard the result if a newer navigation started or
+    // the user already moved to a different directory while we were scanning.
+    const myId = requestIdRef.current;
     try {
       const result = await window.electronAPI.scanDirectory(target, enableAutoRefresh);
+      if (myId !== requestIdRef.current || norm(target) !== norm(currentPathRef.current)) return;
       if (!result.error) {
         setFolders(result.folders);
         setImages(result.images);
@@ -374,7 +405,6 @@ export function useExplorer(
       console.error('Silent refresh error:', err);
     }
   }, [currentPath, enableAutoRefresh]);
-
   // Subscribe to real-time directory changes from Electron file watcher
   useEffect(() => {
     if (!window.electronAPI?.onDirectoryChanged) return;
@@ -396,17 +426,15 @@ export function useExplorer(
 
   const goBack = useCallback(() => {
     if (historyIndex > 0) {
-      const nextIndex = historyIndex - 1;
-      setHistoryIndex(nextIndex);
-      navigateTo(history[nextIndex], false);
+      setHistory((h) => (h.index > 0 ? { ...h, index: h.index - 1 } : h));
+      navigateTo(history.stack[historyIndex - 1], false);
     }
   }, [history, historyIndex, navigateTo]);
 
   const goForward = useCallback(() => {
-    if (historyIndex < history.length - 1) {
-      const nextIndex = historyIndex + 1;
-      setHistoryIndex(nextIndex);
-      navigateTo(history[nextIndex], false);
+    if (historyIndex < history.stack.length - 1) {
+      setHistory((h) => (h.index < h.stack.length - 1 ? { ...h, index: h.index + 1 } : h));
+      navigateTo(history.stack[historyIndex + 1], false);
     }
   }, [history, historyIndex, navigateTo]);
 
@@ -465,14 +493,23 @@ export function useExplorer(
       }
     }
 
-    for (const p of filePaths) {
-      await window.electronAPI.trashFile(p);
-    }
-    if (currentPath) {
+    const results = await Promise.all(filePaths.map((p) => window.electronAPI?.trashFile(p)));
+    const failed = results.filter((r) => !r || !r.success).length;
+    const moved = count - failed;
+
+    if (currentPath && moved > 0) {
       await navigateTo(currentPath, false);
     }
     clearSelection();
-    showToast?.(`${count}개 파일이 휴지통으로 이동되었습니다.`, 'trash');
+
+    // Report partial failures instead of claiming blanket success.
+    if (failed === 0) {
+      showToast?.(`${count}개 파일이 휴지통으로 이동되었습니다.`, 'trash');
+    } else if (moved === 0) {
+      showToast?.('파일을 휴지통으로 이동하지 못했습니다.', 'error');
+    } else {
+      showToast?.(`${moved}개 이동됨, ${failed}개 실패`, 'warning');
+    }
   }, [currentPath, navigateTo, clearSelection, showToast, confirmAction]);
 
   // Filtered and Sorted Images
@@ -571,7 +608,7 @@ export function useExplorer(
     goForward,
     goUp,
     canGoBack: historyIndex > 0,
-    canGoForward: historyIndex < history.length - 1,
+    canGoForward: historyIndex < history.stack.length - 1,
     openDirectoryDialog,
     handleExternalDrop,
     trashFiles,

@@ -4,6 +4,36 @@ import { computeJustifiedLayout } from '../../utils/justifiedLayout';
 import { computeMasonryLayout, computeSquareGridLayout } from '../../utils/masonryLayout';
 import { Image as ImageIcon, Star, Folder, Check } from 'lucide-react';
 import { ContextMenu } from '../ContextMenu/ContextMenu';
+import { GalleryCardImage, THUMBNAIL_SIZE_CLASSES, setThumbnailCacheMaxBytes, warmThumbnailCache } from './GalleryCardImage';
+import { setThumbnailConcurrency } from '../../utils/thumbnailScheduler';
+import { matchesActionBinding } from '../../utils/keyboard';
+import { hasOpenModals } from '../../utils/modalStack';
+import { ThumbnailPlaceholder, KeybindingsConfig } from '../../types';
+
+// Scroll band size for band-quantized virtualization updates.
+const SCROLL_BAND = 200;
+// Formats that must not be decoded-and-resized to a static JPEG thumbnail.
+const SKIP_RESIZE_EXTENSIONS = new Set(['gif', 'webp', 'apng', 'svg']);
+
+/** How a marquee drag combines with the selection made before it started. */
+type MarqueeMode = 'replace' | 'add' | 'subtract';
+
+/** Layout dispatch shared by the render memo and the wheel dead-zone skipper. */
+function computeLayout(
+  images: ImageItem[],
+  layoutMode: LayoutMode,
+  containerWidth: number,
+  thumbnailSize: number,
+  gap: number
+) {
+  if (layoutMode === 'justified') {
+    return computeJustifiedLayout(images, containerWidth, thumbnailSize, gap);
+  }
+  if (layoutMode === 'masonry') {
+    return computeMasonryLayout(images, containerWidth, thumbnailSize, gap);
+  }
+  return computeSquareGridLayout(images, containerWidth, thumbnailSize, gap);
+}
 
 interface GalleryProps {
   images: ImageItem[];
@@ -22,13 +52,27 @@ interface GalleryProps {
   onSelectMultipleImages?: (ids: Set<string>) => void;
   onClearSelection: () => void;
   onOpenQuickLook: (index: number) => void;
-  onThumbnailSizeChange: (size: number) => void;
+  /** Accepts a functional updater so rapid wheel steps are never coalesced. */
+  onThumbnailSizeChange: (update: number | ((prev: number) => number)) => void;
   onToggleBookmark?: (filePath: string) => void;
   onTrashBatch: (paths: string[]) => void;
   onSendToVault?: (vaultId: string, filePaths: string[]) => void;
   onNavigateToFolder?: (path: string) => void;
   onShowToast?: (message: string, type?: ToastType) => void;
   wheelThrottle?: boolean;
+  placeholderStyle?: ThumbnailPlaceholder;
+  /** Custom keybindings (zoom / layout cycle / clear selection). */
+  keybindings?: KeybindingsConfig;
+  /** Size applied by the zoom-reset action (settings default). */
+  defaultZoom?: number;
+  /** Layout switcher for the cycle-layout shortcut. */
+  onLayoutModeChange?: (mode: LayoutMode) => void;
+  /** Max simultaneous thumbnail loads (settings). */
+  thumbConcurrency?: number;
+  /** Session thumbnail cache budget in MB (settings). */
+  thumbCacheMb?: number;
+  /** Whole-folder pre-load limit, 0 disables warming (settings). */
+  thumbWarmLimit?: number;
 }
 
 export const JustifiedGallery: React.FC<GalleryProps> = ({
@@ -55,13 +99,28 @@ export const JustifiedGallery: React.FC<GalleryProps> = ({
   onNavigateToFolder,
   onShowToast,
   wheelThrottle = false,
+  placeholderStyle = 'shimmer',
+  thumbConcurrency = 8,
+  thumbCacheMb = 192,
+  thumbWarmLimit = 4000,
+  keybindings,
+  defaultZoom = 240,
+  onLayoutModeChange,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const justifiedContainerRef = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState<number>(1000);
-  const [scrollTop, setScrollTop] = useState<number>(0);
   const [viewportHeight, setViewportHeight] = useState<number>(800);
+  // Virtual window updates in coarse scroll BANDS, not per pixel: raw
+  // scrollTop changes would re-render every mounted card on every scroll
+  // frame. The exact offset lives in a ref (priority calc only).
+  const scrollTopRef = useRef<number>(0);
+  const appliedBandRef = useRef<number>(0);
+  const [scrollBand, setScrollBand] = useState<number>(0);
   const lastThumbnailZoomTime = useRef<number>(0);
+  // Raw Ctrl+wheel deltaY accumulator — guarantees one size step per notch
+  // even when events arrive faster than React can re-render.
+  const wheelAccumRef = useRef<number>(0);
 
   // Context menu state
   const [contextMenu, setContextMenu] = useState<{
@@ -74,6 +133,7 @@ export const JustifiedGallery: React.FC<GalleryProps> = ({
   const [isMarqueeDragging, setIsMarqueeDragging] = useState<boolean>(false);
   const [marqueeStart, setMarqueeStart] = useState<{ x: number; y: number } | null>(null);
   const [marqueeCurrent, setMarqueeCurrent] = useState<{ x: number; y: number } | null>(null);
+  const [marqueeMode, setMarqueeMode] = useState<MarqueeMode>('replace');
   const hasMarqueeMoved = useRef<boolean>(false);
   const clickedCardId = useRef<string | null>(null);
   const isModifierKey = useRef<boolean>(false);
@@ -97,55 +157,185 @@ export const JustifiedGallery: React.FC<GalleryProps> = ({
     return () => ro.disconnect();
   }, []);
 
-  // Track scroll position for virtual windowing
+  // Track scroll position for virtual windowing (rAF-batched, band-quantized:
+  // state updates only when the scroll crosses a band boundary, so scrolling
+  // no longer re-renders every mounted card per frame).
+  const scrollRafRef = useRef<number | null>(null);
   const handleScroll = useCallback(() => {
-    if (containerRef.current) {
-      setScrollTop(containerRef.current.scrollTop);
-    }
+    if (scrollRafRef.current !== null) return;
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      if (!containerRef.current) return;
+      const st = containerRef.current.scrollTop;
+      scrollTopRef.current = st;
+      const band = Math.floor(st / SCROLL_BAND);
+      if (band !== appliedBandRef.current) {
+        appliedBandRef.current = band;
+        setScrollBand(band);
+      }
+    });
   }, []);
 
-  // Zoom scaling with Ctrl + Wheel
-  const handleWheel = useCallback((e: React.WheelEvent) => {
-    if (e.ctrlKey) {
-      e.preventDefault();
-      if (wheelThrottle) {
-        const now = Date.now();
-        if (now - lastThumbnailZoomTime.current > 40) {
-          lastThumbnailZoomTime.current = now;
-          const delta = e.deltaY < 0 ? 30 : -30;
-          const nextSize = Math.max(80, Math.min(1200, thumbnailSize + delta));
-          onThumbnailSizeChange(nextSize);
-        }
-      } else {
-        const delta = e.deltaY < 0 ? 30 : -30;
-        const nextSize = Math.max(80, Math.min(1200, thumbnailSize + delta));
-        onThumbnailSizeChange(nextSize);
-      }
+  // Cancel any pending scroll frame on unmount
+  useEffect(() => () => {
+    if (scrollRafRef.current !== null) cancelAnimationFrame(scrollRafRef.current);
+  }, []);
+
+  // Zoom scaling with Ctrl + Wheel — attached as a NATIVE non-passive listener.
+  // React registers wheel as passive at its root, so preventDefault() inside
+  // React's onWheel is a no-op and Chromium's page zoom would fire too.
+  // Re-binds on view-branch flips (empty ↔ gallery) because the ref element
+  // is remounted between them.
+  const isEmptyView = images.length === 0;
+  const isEmptyViewRef = useRef(isEmptyView);
+  isEmptyViewRef.current = isEmptyView;
+  // Committed layout, read by the wheel updater to detect dead-zone steps.
+  const layoutResultRef = useRef<{ totalHeight: number } | null>(null);
+
+  // One zoom step with dead-zone skipping (shared by Ctrl+wheel & keyboard):
+  // justified/masonry layouts are pixel-identical between grouping thresholds,
+  // so keep stepping until the rendered layout actually differs from on-screen.
+  const stepThumbnailSize = useCallback((current: number, dir: number): number => {
+    const clampSize = (v: number) => Math.max(80, Math.min(1200, v));
+    let next = clampSize(current + dir * 30);
+    if (next === current || isEmptyViewRef.current || !layoutResultRef.current) return next;
+
+    let guard = 0;
+    while (guard++ < 24) {
+      const candidate = computeLayout(images, layoutMode, containerWidth, next, gap);
+      if (candidate.totalHeight !== layoutResultRef.current.totalHeight) break;
+      const stepped = clampSize(next + dir * 30);
+      if (stepped === next) break; // hit a zoom clamp boundary
+      next = stepped;
     }
-  }, [thumbnailSize, onThumbnailSizeChange, wheelThrottle]);
+    return next;
+  }, [images, layoutMode, containerWidth, gap]);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const handleWheelNative = (e: WheelEvent) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+
+      // Normalize to pixels (line/page deltaModes report tiny values) and
+      // ACCUMULATE raw deltas: a standard notch is ~100. Every notch then
+      // yields exactly one ±30px size step via a FUNCTIONAL update, so wheel
+      // events arriving faster than React re-renders can no longer be
+      // coalesced away (the old closure-based math silently dropped notches
+      // while the app was busy, e.g. during mass thumbnail loading).
+      const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaMode === 2 ? e.deltaY * 100 : e.deltaY;
+      wheelAccumRef.current += dy;
+      const rawSteps = Math.trunc(wheelAccumRef.current / 100);
+      if (rawSteps === 0) return;
+      wheelAccumRef.current -= rawSteps * 100;
+      // Zoom semantics: wheel UP (negative deltaY) enlarges, wheel DOWN shrinks.
+      const steps = -rawSteps;
+
+      if (wheelThrottle && Date.now() - lastThumbnailZoomTime.current <= 40) {
+        return; // remainder stays accumulated; applied on the next event
+      }
+      lastThumbnailZoomTime.current = Date.now();
+
+      const dir = Math.sign(steps * 30);
+      onThumbnailSizeChange((current) => stepThumbnailSize(current, dir));
+    };
+
+    el.addEventListener('wheel', handleWheelNative, { passive: false });
+    return () => el.removeEventListener('wheel', handleWheelNative);
+  }, [isEmptyView, onThumbnailSizeChange, wheelThrottle, stepThumbnailSize]);
+
+  // Gallery-level custom keys: thumbnail zoom, layout cycling, clear selection.
+  // Base-layer listener — ignored while any modal is open or an input is
+  // focused; App's global handler skips QuickLook/Settings-open states.
+  useEffect(() => {
+    if (!keybindings) return;
+    const handleKey = (e: KeyboardEvent) => {
+      if (hasOpenModals()) return;
+      if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
+
+      if (matchesActionBinding(e, keybindings.zoomIn)) {
+        e.preventDefault();
+        onThumbnailSizeChange((current) => stepThumbnailSize(current, 1));
+        return;
+      }
+      if (matchesActionBinding(e, keybindings.zoomOut)) {
+        e.preventDefault();
+        onThumbnailSizeChange((current) => stepThumbnailSize(current, -1));
+        return;
+      }
+      if (matchesActionBinding(e, keybindings.zoomReset)) {
+        e.preventDefault();
+        onThumbnailSizeChange(defaultZoom);
+        return;
+      }
+      if (matchesActionBinding(e, keybindings.cycleLayout)) {
+        e.preventDefault();
+        const next: LayoutMode = layoutMode === 'justified' ? 'masonry' : layoutMode === 'masonry' ? 'grid' : 'justified';
+        onLayoutModeChange?.(next);
+        return;
+      }
+      if (matchesActionBinding(e, keybindings.clearSelection)) {
+        e.preventDefault();
+        onClearSelection();
+        return;
+      }
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [keybindings, onThumbnailSizeChange, stepThumbnailSize, defaultZoom, onLayoutModeChange, layoutMode, onClearSelection]);
 
   // Compute Layout Boxes (Zero-crop Justified / Masonry / Grid)
-  const layoutResult = useMemo(() => {
-    if (layoutMode === 'justified') {
-      return computeJustifiedLayout(images, containerWidth, thumbnailSize, gap);
-    } else if (layoutMode === 'masonry') {
-      return computeMasonryLayout(images, containerWidth, thumbnailSize, gap);
-    } else {
-      return computeSquareGridLayout(images, containerWidth, thumbnailSize, gap);
-    }
-  }, [images, layoutMode, containerWidth, thumbnailSize, gap]);
+  const layoutResult = useMemo(
+    () => computeLayout(images, layoutMode, containerWidth, thumbnailSize, gap),
+    [images, layoutMode, containerWidth, thumbnailSize, gap]
+  );
+  layoutResultRef.current = layoutResult;
 
-  // Virtualization: filter only visible boxes within viewport + 600px buffer
+  // Virtualization: filter only visible boxes within viewport + buffer, in
+  // band-quantized windows (± one extra band of margin guarantees coverage
+  // between band jumps).
   const visibleBoxes = useMemo(() => {
     const buffer = 600;
-    const minTop = scrollTop - buffer;
-    const maxTop = scrollTop + viewportHeight + buffer;
+    const bandTop = scrollBand * SCROLL_BAND;
+    const minTop = bandTop - buffer - SCROLL_BAND;
+    const maxTop = bandTop + viewportHeight + buffer + SCROLL_BAND;
 
     return layoutResult.boxes.filter((box) => {
       const boxBottom = box.top + box.height;
       return boxBottom >= minTop && box.top <= maxTop;
     });
-  }, [layoutResult.boxes, scrollTop, viewportHeight]);
+  }, [layoutResult.boxes, scrollBand, viewportHeight]);
+
+  // Downscaled-cache size class for the current thumbnail zoom level.
+  const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+  const renderPx = Math.min(1536, Math.max(96, Math.round(thumbnailSize * dpr)));
+  const sizeClass = THUMBNAIL_SIZE_CLASSES.find((c) => renderPx <= c) ?? 1536;
+
+  // Apply performance limits from settings (immediate, no reload needed).
+  useEffect(() => {
+    setThumbnailConcurrency(thumbConcurrency);
+    setThumbnailCacheMaxBytes(thumbCacheMb * 1024 * 1024);
+  }, [thumbConcurrency, thumbCacheMb]);
+
+  // Eagerly warm the WHOLE current folder (up to the configured limit; 0
+  // disables warming) so every thumbnail is ready before the user scrolls to
+  // it. Runs at priority 2 — below visible(0)/buffer(1) cards — and no-ops
+  // for anything already cached or in flight.
+  useEffect(() => {
+    if (thumbWarmLimit <= 0) return;
+    const limit = Math.min(images.length, thumbWarmLimit);
+    for (let i = 0; i < limit; i++) {
+      const item = images[i];
+      warmThumbnailCache(
+        item.url,
+        sizeClass,
+        SKIP_RESIZE_EXTENSIONS.has(item.extension.toLowerCase()),
+        2
+      );
+    }
+  }, [images, sizeClass, thumbWarmLimit]);
 
   // Format file size
   const formatSize = (bytes: number) => {
@@ -207,30 +397,33 @@ export const JustifiedGallery: React.FC<GalleryProps> = ({
     clickedCardId.current = cardEl ? cardEl.getAttribute('data-id') : null;
     isModifierKey.current = Boolean(e.ctrlKey || e.shiftKey || e.metaKey);
 
+    // Marquee combination mode, snapshotted at drag start:
+    // Shift+drag adds to the existing selection, Ctrl(+Meta)+drag removes
+    // from it, plain drag replaces it.
+    const mode: MarqueeMode = e.ctrlKey || e.metaKey ? 'subtract' : e.shiftKey ? 'add' : 'replace';
+    marqueeModeRef.current = mode;
+    setMarqueeMode(mode);
+    baseSelectionRef.current = mode === 'replace' ? null : new Set(selectedIds);
+
     hasMarqueeMoved.current = false;
     setIsMarqueeDragging(true);
     setMarqueeStart({ x: startX, y: startY });
     setMarqueeCurrent({ x: startX, y: startY });
   };
 
+  // Latest pointer position during a marquee drag. Flushed to state at most
+  // once per animation frame so dragging never re-renders the app per mousemove.
+  const marqueePointRef = useRef<{ x: number; y: number } | null>(null);
+  const marqueeRafRef = useRef<number | null>(null);
+  const lastMarqueeSelectionRef = useRef<Set<string> | null>(null);
+  const marqueeModeRef = useRef<MarqueeMode>('replace');
+  const baseSelectionRef = useRef<Set<string> | null>(null);
+
   useEffect(() => {
     if (!isMarqueeDragging || !marqueeStart) return;
+    lastMarqueeSelectionRef.current = null;
 
-    const handleMouseMove = (e: MouseEvent) => {
-      const justContainer = justifiedContainerRef.current;
-      if (!justContainer) return;
-
-      const rect = justContainer.getBoundingClientRect();
-      const currentX = e.clientX - rect.left;
-      const currentY = e.clientY - rect.top;
-
-      const dist = Math.hypot(currentX - marqueeStart.x, currentY - marqueeStart.y);
-      if (dist > 4) {
-        hasMarqueeMoved.current = true;
-      }
-
-      setMarqueeCurrent({ x: currentX, y: currentY });
-
+    const computeSelection = (currentX: number, currentY: number): Set<string> => {
       // Compute bounding box
       const minX = Math.min(marqueeStart.x, currentX);
       const maxX = Math.max(marqueeStart.x, currentX);
@@ -254,13 +447,69 @@ export const JustifiedGallery: React.FC<GalleryProps> = ({
           selected.add(box.item.id);
         }
       }
+      return selected;
+    };
 
-      if (onSelectMultipleImages) {
+    const flush = () => {
+      marqueeRafRef.current = null;
+      const point = marqueePointRef.current;
+      if (!point) return;
+      setMarqueeCurrent(point);
+
+      const hitSet = computeSelection(point.x, point.y);
+      // Combine with the pre-drag selection according to the mode snapshotted
+      // at mousedown: Shift+drag unions, Ctrl+drag subtracts, plain replaces.
+      const mode = marqueeModeRef.current;
+      let selected: Set<string>;
+      if (mode === 'add' && baseSelectionRef.current) {
+        selected = new Set(baseSelectionRef.current);
+        hitSet.forEach((id) => selected.add(id));
+      } else if (mode === 'subtract') {
+        selected = new Set(baseSelectionRef.current ?? []);
+        hitSet.forEach((id) => selected.delete(id));
+      } else {
+        selected = hitSet;
+      }
+
+      // Propagate only when the selection actually changed — otherwise every
+      // mousemove churns App-level state through the whole component tree.
+      const prev = lastMarqueeSelectionRef.current;
+      const changed =
+        !prev ||
+        prev.size !== selected.size ||
+        Array.from(selected).some((id) => !prev.has(id));
+      if (changed && onSelectMultipleImages) {
+        lastMarqueeSelectionRef.current = selected;
         onSelectMultipleImages(selected);
       }
     };
 
+    const handleMouseMove = (e: MouseEvent) => {
+      const justContainer = justifiedContainerRef.current;
+      if (!justContainer) return;
+
+      const rect = justContainer.getBoundingClientRect();
+      const currentX = e.clientX - rect.left;
+      const currentY = e.clientY - rect.top;
+
+      const dist = Math.hypot(currentX - marqueeStart.x, currentY - marqueeStart.y);
+      if (dist > 4) {
+        hasMarqueeMoved.current = true;
+      }
+
+      marqueePointRef.current = { x: currentX, y: currentY };
+      if (marqueeRafRef.current === null) {
+        marqueeRafRef.current = requestAnimationFrame(flush);
+      }
+    };
+
     const handleMouseUp = () => {
+      // Flush any pending frame so the final selection sticks before teardown.
+      if (marqueeRafRef.current !== null) {
+        cancelAnimationFrame(marqueeRafRef.current);
+        marqueeRafRef.current = null;
+        flush();
+      }
       // If user simply clicked without dragging
       if (!hasMarqueeMoved.current) {
         if (clickedCardId.current) {
@@ -272,6 +521,9 @@ export const JustifiedGallery: React.FC<GalleryProps> = ({
       setIsMarqueeDragging(false);
       setMarqueeStart(null);
       setMarqueeCurrent(null);
+      setMarqueeMode('replace');
+      marqueeModeRef.current = 'replace';
+      baseSelectionRef.current = null;
       clickedCardId.current = null;
     };
 
@@ -280,6 +532,10 @@ export const JustifiedGallery: React.FC<GalleryProps> = ({
     return () => {
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
+      if (marqueeRafRef.current !== null) {
+        cancelAnimationFrame(marqueeRafRef.current);
+        marqueeRafRef.current = null;
+      }
     };
   }, [isMarqueeDragging, marqueeStart, layoutResult.boxes, onSelectMultipleImages, onSelectImage, onClearSelection]);
 
@@ -485,7 +741,6 @@ export const JustifiedGallery: React.FC<GalleryProps> = ({
       ref={containerRef}
       className="gallery-workspace"
       onScroll={handleScroll}
-      onWheel={handleWheel}
       onMouseDown={handleMouseDownOnCanvas}
     >
       {renderFolderSection()}
@@ -497,9 +752,12 @@ export const JustifiedGallery: React.FC<GalleryProps> = ({
           height: `${layoutResult.totalHeight + 32}px`,
         }}
       >
-        {/* Marquee Drag Selection Box */}
+        {/* Marquee Drag Selection Box (color reflects combine mode) */}
         {marqueeBoxStyle && (
-          <div className="marquee-selection-box" style={marqueeBoxStyle} />
+          <div
+            className={`marquee-selection-box${marqueeMode === 'add' ? ' mode-add' : marqueeMode === 'subtract' ? ' mode-subtract' : ''}`}
+            style={marqueeBoxStyle}
+          />
         )}
 
         {visibleBoxes.map((box) => {
@@ -543,14 +801,14 @@ export const JustifiedGallery: React.FC<GalleryProps> = ({
                 });
               }}
             >
-              {/* Image element */}
-              <img
-                src={box.item.url}
+              {/* Image element (downscaled cache + scheduled load) */}
+              <GalleryCardImage
+                url={box.item.url}
                 alt={box.item.name}
-                className="card-image"
-                loading="lazy"
-                decoding="async"
-                draggable={false}
+                priority={box.top < scrollTopRef.current + viewportHeight && box.top + box.height > scrollTopRef.current ? 0 : 1}
+                placeholder={placeholderStyle}
+                sizeClass={sizeClass}
+                skipResize={SKIP_RESIZE_EXTENSIONS.has(box.item.extension.toLowerCase())}
               />
 
               {/* Selection Checkmark Badge (Top-Left) */}

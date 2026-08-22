@@ -7,7 +7,11 @@ import { KeybindingPair, StorageVault } from '../types';
 export function formatKeyEvent(e: KeyboardEvent | React.KeyboardEvent): string {
   const parts: string[] = [];
 
-  if (e.ctrlKey || e.metaKey) parts.push('Ctrl');
+  // Meta (Win key) is reported separately from Ctrl: collapsing the two made
+  // Meta chords indistinguishable from Ctrl chords and a bare Meta keypress
+  // display as "Ctrl".
+  if (e.ctrlKey) parts.push('Ctrl');
+  if (e.metaKey) parts.push('Meta');
   if (e.altKey) parts.push('Alt');
   if (e.shiftKey) parts.push('Shift');
 
@@ -22,7 +26,7 @@ export function formatKeyEvent(e: KeyboardEvent | React.KeyboardEvent): string {
     key = key.toUpperCase();
   }
 
-  // Avoid duplicate modifier names
+  // Modifier-only keypress: report just the modifiers (bare Meta → 'Meta')
   if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) {
     return parts.join('+');
   }
@@ -31,25 +35,38 @@ export function formatKeyEvent(e: KeyboardEvent | React.KeyboardEvent): string {
   return parts.join('+');
 }
 
+// Common aliases so stored/hand-edited bindings like 'Esc' or 'Del' still match
+// the canonical names formatKeyEvent produces ('Escape', 'Delete').
+const KEY_ALIASES: Record<string, string> = { esc: 'escape', del: 'delete' };
+const normalizeKeyName = (k: string): string => KEY_ALIASES[k] || k;
+
 /**
  * Test if a KeyboardEvent matches a configured single keybinding string.
  */
 export function matchesKeybinding(e: KeyboardEvent, binding?: string): boolean {
   if (!binding || !binding.trim()) return false;
 
-  const eventFormatted = formatKeyEvent(e).toLowerCase();
-  const bindingNormalized = binding.trim().toLowerCase();
+  // Compare as a modifier SET + key instead of strict string equality, so
+  // bindings written in any modifier order ('Shift+Ctrl+P') match the event.
+  const eventParts = formatKeyEvent(e).split('+').map((p) => p.trim().toLowerCase()).filter(Boolean);
+  const eventKey = normalizeKeyName(eventParts[eventParts.length - 1]);
+  const eventMods = new Set(eventParts.slice(0, -1));
 
-  if (eventFormatted === bindingNormalized) return true;
+  const bindingParts = binding.trim().split('+').map((p) => p.trim().toLowerCase()).filter(Boolean);
+  const bindingKey = normalizeKeyName(bindingParts[bindingParts.length - 1]);
+  const bindingMods = new Set(bindingParts.slice(0, -1));
+
+  const sameMods = eventMods.size === bindingMods.size && [...eventMods].every((m) => bindingMods.has(m));
+  if (sameMods && eventKey === bindingKey) return true;
 
   // Single key fallback without modifiers (e.g. '1', 'Q', 'D', 'Space', 'Delete', 'Enter', 'Backspace')
   if (!e.ctrlKey && !e.altKey && !e.metaKey) {
-    if (bindingNormalized === 'space' && (e.code === 'Space' || e.key === ' ')) return true;
-    if (bindingNormalized === 'enter' && e.key === 'Enter') return true;
-    if (bindingNormalized === 'escape' && (e.key === 'Escape' || e.key === 'Esc')) return true;
-    if ((bindingNormalized === 'delete' || bindingNormalized === 'del') && (e.key === 'Delete' || e.code === 'Delete')) return true;
-    if (bindingNormalized === 'backspace' && (e.key === 'Backspace' || e.code === 'Backspace')) return true;
-    if (e.key.toLowerCase() === bindingNormalized) return true;
+    if (bindingKey === 'space' && (e.code === 'Space' || e.key === ' ')) return true;
+    if (bindingKey === 'enter' && e.key === 'Enter') return true;
+    if (bindingKey === 'escape' && (e.key === 'Escape' || e.key === 'Esc')) return true;
+    if (bindingKey === 'delete' && (e.key === 'Delete' || e.code === 'Delete')) return true;
+    if (bindingKey === 'backspace' && (e.key === 'Backspace' || e.code === 'Backspace')) return true;
+    if (normalizeKeyName(e.key.toLowerCase()) === bindingKey) return true;
   }
 
   return false;

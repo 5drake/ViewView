@@ -1,5 +1,6 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { AlertTriangle } from 'lucide-react';
+import { pushModal, popModal, isTopmostModal } from '../../utils/modalStack';
 
 export interface ConfirmOptions {
   title: string;
@@ -43,6 +44,31 @@ export const ConfirmDialog: React.FC<{
   options: ConfirmOptions | null;
   onResolve: (result: boolean) => void;
 }> = ({ options, onResolve }) => {
+  const isOpen = Boolean(options);
+
+  // Register in the topmost-modal stack while open so lower overlays
+  // (QuickLook, SettingsModal) ignore their window-level key handlers.
+  useEffect(() => {
+    if (!isOpen) return;
+    pushModal('confirm');
+    return () => popModal('confirm');
+  }, [isOpen]);
+
+  // Escape cancels the dialog (it is the topmost layer whenever visible).
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKey = (e: KeyboardEvent) => {
+      if (!isTopmostModal('confirm')) return;
+      if (e.key === 'Escape' || e.key === 'Esc') {
+        e.preventDefault();
+        e.stopPropagation();
+        onResolve(false);
+      }
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [isOpen, onResolve]);
+
   if (!options) return null;
 
   return (

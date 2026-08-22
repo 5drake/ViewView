@@ -1,6 +1,9 @@
 export type LayoutMode = 'justified' | 'masonry' | 'grid';
 export type ThemeMode = 'dark' | 'light';
 
+/** Style of the placeholder shown while a gallery thumbnail is loading. */
+export type ThumbnailPlaceholder = 'shimmer' | 'pulse' | 'solid' | 'none';
+
 export type SortField = 'name' | 'date' | 'size' | 'width' | 'height' | 'type';
 export type SortDirection = 'asc' | 'desc';
 
@@ -133,6 +136,24 @@ export interface KeybindingsConfig {
   navigateBack: KeybindingPair;    // Default: { primary: 'Backspace', secondary: 'Alt+ArrowLeft' }
   navigateForward: KeybindingPair; // Default: { primary: 'Alt+ArrowRight', secondary: '' }
   navigateUp: KeybindingPair;      // Default: { primary: 'Alt+ArrowUp', secondary: '' }
+  // --- 갤러리 확장 ---
+  zoomIn: KeybindingPair;          // Default: { primary: '=', secondary: '+' } — 썸네일 확대
+  zoomOut: KeybindingPair;         // Default: { primary: '-', secondary: '' } — 썸네일 축소
+  zoomReset: KeybindingPair;       // Default: { primary: '0', secondary: '' } — 기본 크기
+  cycleLayout: KeybindingPair;     // Default: { primary: 'L', secondary: '' } — 레이아웃 순환
+  copyImage: KeybindingPair;       // Default: { primary: 'Ctrl+C', secondary: '' } — 이미지 클립보드 복사
+  copyPath: KeybindingPair;        // Default: { primary: 'Shift+P', secondary: '' } — 파일 경로 복사
+  showInExplorer: KeybindingPair;  // Default: { primary: 'Shift+E', secondary: '' } — 탐색기에서 표시
+  selectAll: KeybindingPair;       // Default: { primary: 'Ctrl+A', secondary: '' } — 전체 선택
+  clearSelection: KeybindingPair;  // Default: { primary: 'Escape', secondary: '' } — 선택 해제
+  refresh: KeybindingPair;         // Default: { primary: 'F5', secondary: '' } — 새로고침
+  // --- 퀵룩 확장 ---
+  qlNext: KeybindingPair;          // Default: { primary: 'ArrowRight', secondary: 'PageDown' }
+  qlPrev: KeybindingPair;          // Default: { primary: 'ArrowLeft', secondary: 'PageUp' }
+  qlZoomIn: KeybindingPair;        // Default: { primary: '=', secondary: '+' }
+  qlZoomOut: KeybindingPair;       // Default: { primary: '-', secondary: '_' }
+  qlZoomReset: KeybindingPair;     // Default: { primary: '0', secondary: '' }
+  qlToggleInfo: KeybindingPair;    // Default: { primary: 'I', secondary: 'Tab' }
 }
 
 export interface AppSettings {
@@ -141,6 +162,13 @@ export interface AppSettings {
   defaultGap: number;
   defaultSortField: SortField;
   defaultSortDirection: SortDirection;
+  thumbnailPlaceholder: ThumbnailPlaceholder;
+  /** Max simultaneous gallery thumbnail loads. */
+  thumbConcurrentLoads: number;
+  /** Session thumbnail blob-cache budget in megabytes. */
+  thumbCacheMaxMb: number;
+  /** How many images of the current folder to pre-load (0 = off). */
+  thumbWarmLimit: number;
   doubleClickAction: 'quicklook' | 'defaultViewer';
   showFilenameOnCards: 'hover' | 'always' | 'never';
   showFoldersInGallery: boolean;

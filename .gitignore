@@ -31,5 +31,6 @@ pnpm-debug.log*
 Thumbs.db
 
 # Source design assets (icon source files, not needed for build)
-icon.psd
-icon.png
+# Root-anchored so same-named assets elsewhere (e.g. public/icon.png) stay tracked.
+/icon.psd
+/icon.png

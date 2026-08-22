@@ -21,6 +21,7 @@ import {
 import { ImageItem, StorageVault, KeybindingsConfig, ExifData, ToastType } from '../../types';
 import { matchesVaultBinding, matchesActionBinding } from '../../utils/keyboard';
 import { parseImageExif } from '../../utils/metadata';
+import { pushModal, popModal, isTopmostModal } from '../../utils/modalStack';
 import { AnimationPlayer } from './AnimationPlayer';
 
 interface QuickLookProps {
@@ -97,11 +98,16 @@ export const QuickLookModal: React.FC<QuickLookProps> = ({
   }, [image?.url]);
 
   // Copy text helper
+  const copiedFieldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (copiedFieldTimerRef.current) clearTimeout(copiedFieldTimerRef.current);
+  }, []);
   const handleCopyText = useCallback((text: string, fieldName: string) => {
     navigator.clipboard.writeText(text);
     setCopiedField(fieldName);
     onShowToast?.(`${fieldName}이(가) 클립보드에 복사되었습니다.`, 'copy');
-    setTimeout(() => {
+    if (copiedFieldTimerRef.current) clearTimeout(copiedFieldTimerRef.current);
+    copiedFieldTimerRef.current = setTimeout(() => {
       setCopiedField(null);
     }, 2000);
   }, [onShowToast]);
@@ -117,11 +123,21 @@ export const QuickLookModal: React.FC<QuickLookProps> = ({
     onClose();
   }, [image, onClose]);
 
+  // Register this overlay in the topmost-modal stack so lower layers (and any
+  // modal opened above us) can coordinate window-level keyboard handling.
+  useEffect(() => {
+    if (!isOpen) return;
+    pushModal('quicklook');
+    return () => popModal('quicklook');
+  }, [isOpen]);
+
   // Keyboard navigation & zoom shortcuts inside QuickLook
   useEffect(() => {
     if (!isOpen) return;
 
     const handleKey = (e: KeyboardEvent) => {
+      // A modal stacked above us (ConfirmDialog, SettingsModal) owns the keys.
+      if (!isTopmostModal('quicklook')) return;
       if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
 
       // Check Space / Escape / custom quickLook keybinding to close immediately
@@ -136,14 +152,14 @@ export const QuickLookModal: React.FC<QuickLookProps> = ({
         return;
       }
 
-      // Next / Previous Image navigation
-      if (e.key === 'ArrowRight' || e.key === 'PageDown') {
+      // Next / Previous Image navigation (customizable)
+      if (keybindings?.qlNext && matchesActionBinding(e, keybindings.qlNext)) {
         e.preventDefault();
         e.stopPropagation();
         onNext?.();
         return;
       }
-      if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+      if (keybindings?.qlPrev && matchesActionBinding(e, keybindings.qlPrev)) {
         e.preventDefault();
         e.stopPropagation();
         onPrev?.();
@@ -153,7 +169,7 @@ export const QuickLookModal: React.FC<QuickLookProps> = ({
       if (e.key === 'Enter') {
         e.preventDefault();
         handleOpenDefault();
-      } else if (e.key === '0' || e.key === 'f' || e.key === 'F') {
+      } else if (keybindings?.qlZoomReset && matchesActionBinding(e, keybindings.qlZoomReset)) {
         e.preventDefault();
         setScale(1);
         setOffset({ x: 0, y: 0 });
@@ -165,13 +181,13 @@ export const QuickLookModal: React.FC<QuickLookProps> = ({
           setScale(1.5);
           setOffset({ x: 0, y: 0 });
         }
-      } else if (e.key === '=' || e.key === '+') {
+      } else if (keybindings?.qlZoomIn && matchesActionBinding(e, keybindings.qlZoomIn)) {
         e.preventDefault();
         setScale((prev) => Math.min(30, prev * 1.25));
-      } else if (e.key === '-' || e.key === '_') {
+      } else if (keybindings?.qlZoomOut && matchesActionBinding(e, keybindings.qlZoomOut)) {
         e.preventDefault();
         setScale((prev) => Math.max(0.1, prev / 1.25));
-      } else if (e.key === 'Tab' || e.code === 'Tab' || e.key === 'i' || e.key === 'I') {
+      } else if (keybindings?.qlToggleInfo && matchesActionBinding(e, keybindings.qlToggleInfo)) {
         e.preventDefault();
         setShowMetadata((prev) => !prev);
       }
@@ -224,53 +240,59 @@ export const QuickLookModal: React.FC<QuickLookProps> = ({
     return () => window.removeEventListener('keydown', handleKey);
   }, [isOpen, handleOpenDefault, onClose, onNext, onPrev, vaults, onSendToVault, onToggleBookmark, onTrashBatch, keybindings, image]);
 
-  // Mouse wheel zoom towards cursor position or Alt/Ctrl+Wheel to navigate images
-  const handleWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
+  // Mouse wheel zoom towards cursor position or Alt/Ctrl+Wheel to navigate.
+  // Attached as a NATIVE non-passive listener: React registers wheel as passive
+  // at its root, so preventDefault() inside React's onWheel is a no-op and
+  // Chromium's page zoom/pinch would fire alongside the custom zoom.
+  useEffect(() => {
+    if (!isOpen) return;
+    const el = containerRef.current;
+    if (!el) return;
 
-    // Alt or Ctrl or Meta + Wheel: Navigate between images
-    if (e.altKey || e.ctrlKey || e.metaKey) {
-      if (wheelThrottle) {
-        const now = Date.now();
-        if (now - lastWheelNavTime.current > 120) {
-          lastWheelNavTime.current = now;
+    const handleWheelNative = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      // Alt or Ctrl or Meta + Wheel: Navigate between images
+      if (e.altKey || e.ctrlKey || e.metaKey) {
+        if (wheelThrottle) {
+          const now = Date.now();
+          if (now - lastWheelNavTime.current > 120) {
+            lastWheelNavTime.current = now;
+            if (e.deltaY > 0) {
+              onNext?.();
+            } else if (e.deltaY < 0) {
+              onPrev?.();
+            }
+          }
+        } else {
           if (e.deltaY > 0) {
             onNext?.();
           } else if (e.deltaY < 0) {
             onPrev?.();
           }
         }
-      } else {
-        if (e.deltaY > 0) {
-          onNext?.();
-        } else if (e.deltaY < 0) {
-          onPrev?.();
-        }
+        return;
       }
-      return;
-    }
 
-    const zoomFactor = e.deltaY < 0 ? 1.15 : 0.87;
-    const nextScale = Math.max(0.1, Math.min(30, scale * zoomFactor));
+      const zoomFactor = e.deltaY < 0 ? 1.15 : 0.87;
+      const nextScale = Math.max(0.1, Math.min(30, scale * zoomFactor));
 
-    const container = containerRef.current;
-    if (!container) {
+      const rect = el.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left - rect.width / 2;
+      const mouseY = e.clientY - rect.top - rect.height / 2;
+
+      // Adjust offset to keep mouse point anchored during zoom
+      const nextOffsetX = mouseX - (mouseX - offset.x) * (nextScale / scale);
+      const nextOffsetY = mouseY - (mouseY - offset.y) * (nextScale / scale);
+
       setScale(nextScale);
-      return;
-    }
+      setOffset({ x: nextOffsetX, y: nextOffsetY });
+    };
 
-    const rect = container.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left - rect.width / 2;
-    const mouseY = e.clientY - rect.top - rect.height / 2;
-
-    // Adjust offset to keep mouse point anchored during zoom
-    const nextOffsetX = mouseX - (mouseX - offset.x) * (nextScale / scale);
-    const nextOffsetY = mouseY - (mouseY - offset.y) * (nextScale / scale);
-
-    setScale(nextScale);
-    setOffset({ x: nextOffsetX, y: nextOffsetY });
-  }, [scale, offset, onNext, onPrev, wheelThrottle]);
+    el.addEventListener('wheel', handleWheelNative, { passive: false });
+    return () => el.removeEventListener('wheel', handleWheelNative);
+  }, [isOpen, scale, offset, onNext, onPrev, wheelThrottle]);
 
   // Mouse drag pan handlers (window-level listeners to prevent losing tracking)
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
@@ -876,7 +898,6 @@ export const QuickLookModal: React.FC<QuickLookProps> = ({
           position: 'relative',
           cursor: isDragging ? 'grabbing' : scale > 1 ? 'grab' : 'default',
         }}
-        onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onDoubleClick={handleDoubleClick}
         onClick={handleCanvasClick}

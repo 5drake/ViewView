@@ -44,6 +44,19 @@ export const InspectorPanel: React.FC<InspectorProps> = ({
   const [histogram, setHistogram] = useState<{ r: number[]; g: number[]; b: number[]; l: number[] } | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
+  // Managed "copied" indicator timers so quick successive copies (or switching
+  // images) can't leave a stale timer clearing a newer flag or firing after
+  // unmount.
+  const copiedTimersRef = useRef<Partial<Record<'hex' | 'prompt' | 'char' | 'neg', ReturnType<typeof setTimeout>>>>({});
+  const startCopiedTimer = (field: 'hex' | 'prompt' | 'char' | 'neg', clear: () => void) => {
+    const prev = copiedTimersRef.current[field];
+    if (prev) clearTimeout(prev);
+    copiedTimersRef.current[field] = setTimeout(clear, 1500);
+  };
+  useEffect(() => () => {
+    Object.values(copiedTimersRef.current).forEach((t) => { if (t) clearTimeout(t); });
+  }, []);
+
   useEffect(() => {
     if (!image) {
       setExif(null);
@@ -70,7 +83,17 @@ export const InspectorPanel: React.FC<InspectorProps> = ({
     return () => {
       isMounted = false;
     };
-  }, [image]);
+    // Depend on the URL, not object identity: parent state changes (bookmark
+    // toggles, list refreshes) rebuild ImageItem objects and previously
+    // re-ran a full EXIF parse + image decode + histogram pass for the SAME file.
+  }, [image?.url]);
+
+  // Reset UI state when switching to a different image
+  useEffect(() => {
+    setExif(null);
+    setPalette([]);
+    setHistogram(null);
+  }, [image?.url]);
 
   // Draw Histogram to Canvas
   useEffect(() => {
@@ -138,11 +161,11 @@ export const InspectorPanel: React.FC<InspectorProps> = ({
     if (isHex) {
       setCopiedHex(text);
       onShowToast?.(`색상 코드 [${text}]가 복사되었습니다.`, 'copy');
-      setTimeout(() => setCopiedHex(null), 1500);
+      startCopiedTimer('hex', () => setCopiedHex(null));
     } else {
       setCopiedPrompt(true);
       onShowToast?.('AI 생성 프롬프트가 복사되었습니다.', 'copy');
-      setTimeout(() => setCopiedPrompt(false), 1500);
+      startCopiedTimer('prompt', () => setCopiedPrompt(false));
     }
   };
 
@@ -154,13 +177,13 @@ export const InspectorPanel: React.FC<InspectorProps> = ({
     }
     if (type === 'prompt') {
       setCopiedPrompt(true);
-      setTimeout(() => setCopiedPrompt(false), 1500);
+      startCopiedTimer('prompt', () => setCopiedPrompt(false));
     } else if (type === 'char') {
       setCopiedCharPrompt(true);
-      setTimeout(() => setCopiedCharPrompt(false), 1500);
+      startCopiedTimer('char', () => setCopiedCharPrompt(false));
     } else if (type === 'neg') {
       setCopiedNegPrompt(true);
-      setTimeout(() => setCopiedNegPrompt(false), 1500);
+      startCopiedTimer('neg', () => setCopiedNegPrompt(false));
     }
     onShowToast?.(`${label}이(가) 복사되었습니다.`, 'copy');
   };

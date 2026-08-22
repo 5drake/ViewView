@@ -55,21 +55,26 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
 
   const isMultiSelect = selectedImages.length > 1;
 
-  // Close context menu on outside click or scroll
+  // Close context menu on outside click or scroll. The latest onClose is read
+  // through a ref so callers passing an inline arrow (recreated every render)
+  // don't cause the window listeners to be torn down and re-added per render.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     const handleOutside = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        onClose();
+        onCloseRef.current();
       }
     };
+    const handleWheelClose = () => onCloseRef.current();
 
     window.addEventListener('mousedown', handleOutside);
-    window.addEventListener('wheel', onClose, { passive: true });
+    window.addEventListener('wheel', handleWheelClose, { passive: true });
     return () => {
       window.removeEventListener('mousedown', handleOutside);
-      window.removeEventListener('wheel', onClose);
+      window.removeEventListener('wheel', handleWheelClose);
     };
-  }, [onClose]);
+  }, []);
 
   // Adjust positioning within viewport
   const menuWidth = 220;

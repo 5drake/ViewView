@@ -20,7 +20,22 @@ export function useVaults(showToastProp?: (message: string, type?: ToastType) =>
     try {
       const saved = localStorage.getItem('viewview-vaults');
       if (saved) {
-        return JSON.parse(saved);
+        const parsed = JSON.parse(saved);
+        // Shape-validate before the value reaches render: corrupt or
+        // non-array JSON must never crash the app at boot (unlike settings
+        // and bookmarks, this hook previously trusted the stored shape).
+        if (!Array.isArray(parsed)) return DEFAULT_VAULTS;
+        return parsed
+          .filter((v: any) => v && typeof v === 'object' && typeof v.id === 'string' && typeof v.path === 'string')
+          .map((v: any, i: number) => ({
+            id: v.id,
+            name: typeof v.name === 'string' ? v.name : `보관함 ${i + 1}`,
+            path: v.path,
+            shortcutKey: typeof v.shortcutKey === 'string' && v.shortcutKey ? v.shortcutKey : String((i % 9) + 1),
+            secondaryKey: typeof v.secondaryKey === 'string' ? v.secondaryKey : undefined,
+            color: typeof v.color === 'string' ? v.color : VAULT_COLORS[i % VAULT_COLORS.length],
+            createdAt: typeof v.createdAt === 'number' ? v.createdAt : Date.now(),
+          })) as StorageVault[];
       }
     } catch (e) {
       console.error('Failed to load vaults from localStorage:', e);
@@ -83,14 +98,14 @@ export function useVaults(showToastProp?: (message: string, type?: ToastType) =>
   }, [vaults, getNextShortcutKey, showToast]);
 
   const removeVault = useCallback((vaultId: string) => {
-    setVaults((prev) => {
-      const target = prev.find((v) => v.id === vaultId);
-      if (target) {
-        showToast(`'${target.name}' 보관함 등록이 해제되었습니다.`, 'info');
-      }
-      return prev.filter((v) => v.id !== vaultId);
-    });
-  }, [showToast]);
+    // Look the target up OUTSIDE the updater — toasts are side effects and must
+    // not run inside a state updater (StrictMode double-invokes them).
+    const target = vaults.find((v) => v.id === vaultId);
+    setVaults((prev) => prev.filter((v) => v.id !== vaultId));
+    if (target) {
+      showToast(`'${target.name}' 보관함 등록이 해제되었습니다.`, 'info');
+    }
+  }, [vaults, showToast]);
 
   const updateVault = useCallback((vaultId: string, updates: Partial<StorageVault>) => {
     setVaults((prev) =>

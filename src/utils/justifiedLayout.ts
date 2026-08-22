@@ -56,10 +56,19 @@ export function computeJustifiedLayout(
       // If it's the last incomplete row and the height would be stretched too much
       let finalRowHeight = predictedHeight;
       let isStretchingTooMuch = predictedHeight > targetRowHeight * maxRowHeightScale;
-      
+
       if (isLastItem && isStretchingTooMuch) {
         // Keep targetRowHeight for last row so items don't look giant
         finalRowHeight = targetRowHeight;
+      }
+
+      // Minimum visible height: an extreme panorama alone in its row computes
+      // to a sub-pixel height that rounds to 0px and renders invisibly. With
+      // the clamp such a row overflows horizontally instead (clipped by the
+      // container) but at least stays visible.
+      const MIN_ROW_HEIGHT = 40;
+      if (finalRowHeight < MIN_ROW_HEIGHT) {
+        finalRowHeight = MIN_ROW_HEIGHT;
       }
 
       // Lay out each item in the closed row

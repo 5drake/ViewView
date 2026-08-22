@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Play, Pause, SkipBack, SkipForward, Gauge, Film } from 'lucide-react';
+import { isTopmostModal } from '../../utils/modalStack';
 
 interface AnimationPlayerProps {
   imageUrl: string;
@@ -38,11 +39,20 @@ export const AnimationPlayer: React.FC<AnimationPlayerProps> = ({
   isPlayingRef.current = isPlaying;
   playbackSpeedRef.current = playbackSpeed;
 
-  // Draw a specific decoded frame to canvas
+  // Draw a specific decoded frame to canvas. Monotonic sequence token: when a
+  // decode is slower than the timer delay the draws would overlap and frames
+  // could paint out of order (backwards flicker on heavy GIFs) — a stale draw
+  // is dropped as soon as a newer one is requested.
+  const drawSeqRef = useRef(0);
   const drawFrame = useCallback(async (frameIndex: number) => {
     if (!decoderRef.current || !canvasRef.current) return;
+    const seq = ++drawSeqRef.current;
     try {
       const { image } = await decoderRef.current.decode({ frameIndex });
+      if (seq !== drawSeqRef.current) {
+        image.close();
+        return;
+      }
       const canvas = canvasRef.current;
       if (!canvas) {
         image.close();
@@ -101,8 +111,61 @@ export const AnimationPlayer: React.FC<AnimationPlayerProps> = ({
         const track = decoder.tracks.selectedTrack;
         const count = track ? track.frameCount : 1;
 
+        // Populate real per-frame durations (ms): decode each frame once,
+        // read its VideoFrame.timestamp (microseconds), and derive each
+        // duration from the delta to the next frame's timestamp. Frames with
+        // invalid deltas stay unset so playback falls back to its default.
+        const precomputeFrameDurations = async () => {
+          const stamps: number[] = [];
+          for (let i = 0; i < count; i++) {
+            try {
+              const { image } = await decoder.decode({ frameIndex: i });
+              stamps.push(typeof image.timestamp === 'number' ? image.timestamp : NaN);
+              image.close();
+            } catch {
+              break; // stop early; unstamped frames keep the default delay
+            }
+            if (!isMounted || decoderRef.current !== decoder) return;
+          }
+
+          const gaps: number[] = [];
+          let lastDelta = 0;
+          let prev: number | undefined;
+          for (const ts of stamps) {
+            if (prev !== undefined) {
+              const deltaMs = (ts - prev) / 1000;
+              if (Number.isFinite(deltaMs) && deltaMs > 0) {
+                gaps.push(deltaMs);
+                lastDelta = deltaMs;
+              } else {
+                gaps.push(0);
+              }
+            }
+            prev = ts;
+          }
+
+          // Last frame: reuse the previous delta, else the track-level
+          // duration/frameCount when the track reports one.
+          let tail = lastDelta;
+          if (
+            !(tail > 0) &&
+            track &&
+            typeof track.duration === 'number' &&
+            Number.isFinite(track.duration) &&
+            track.duration > 0
+          ) {
+            const avgMs = track.duration / count / 1000;
+            if (Number.isFinite(avgMs) && avgMs > 0) tail = avgMs;
+          }
+
+          if (!isMounted || decoderRef.current !== decoder) return;
+          frameDurationsRef.current = [...gaps, tail > 0 ? tail : 0];
+        };
+
         if (count > 1) {
           decoderRef.current = decoder;
+          frameDurationsRef.current = [];
+          precomputeFrameDurations();
           setTotalFrames(count);
           setCurrentFrame(0);
           setHasDecoded(true);
@@ -123,6 +186,7 @@ export const AnimationPlayer: React.FC<AnimationPlayerProps> = ({
     return () => {
       isMounted = false;
       if (animationTimerRef.current) clearTimeout(animationTimerRef.current);
+      frameDurationsRef.current = [];
       if (decoderRef.current) {
         try {
           decoderRef.current.close();
@@ -176,6 +240,7 @@ export const AnimationPlayer: React.FC<AnimationPlayerProps> = ({
     if (!hasDecoded) return;
 
     const handleKey = (e: KeyboardEvent) => {
+      if (!isTopmostModal('quicklook')) return;
       if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
 
       if (e.key === 'k' || e.key === 'K') {
